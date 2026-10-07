@@ -27,4 +27,20 @@ def collect(rt: Runtime) -> dict[str, str]:
         "quota": rt.accumulator.describe(),
         "audit": rt.auditor.describe(),
         "schedule": rt.scheduler.describe(rt.rooms),
+        "calibration": _describe_calibration(rt),
     }
+
+
+def _describe_calibration(rt: Runtime) -> str:
+    points = rt.registry.point_ids()
+    if not points:
+        return "calibration points=0"
+    parts = [f"points={len(points)}"]
+    for point in points:
+        state = rt.registry.state_view(point)
+        probe = state.get("probe") or {}
+        parts.append(
+            f"{point}:{state['migration']}/"
+            f"{state.get('authoritative_basis') or '-'} probe={probe.get('id') or '-'}"
+        )
+    return "calibration " + " ".join(parts)

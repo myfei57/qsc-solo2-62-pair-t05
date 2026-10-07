@@ -5,6 +5,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from coldstore.ammonia import validate_ppm, validate_threshold
+from coldstore.ammonia.monitor import LATCH_KEY
+from coldstore.ammonia.monitor import level_for as ammonia_level_for
+from coldstore.calib import DEFAULT_POINT
+from coldstore.calib.curve import parse_point
 from coldstore.comp import validate_stage
 from coldstore.evap import validate_baseline
 from coldstore.fan import PRIMARY, STANDBY
@@ -645,6 +649,198 @@ def audit_filter(server: "Server", request: Request) -> Response:
 
 def audit_totals(server: "Server", request: Request) -> Response:
     return json_response({"totals": server.runtime.auditor.totals()})
+
+
+def _points_field(request: Request) -> list[Point]:
+    raw_points = request.payload.get("points", [])
+    if not isinstance(raw_points, list):
+        raise ValueError("points must be a list of {raw, reference} pairs")
+    points: list[Point] = []
+    for item in raw_points:
+        point = parse_point(item)
+        if point is None:
+            raise ValueError("every point needs numeric raw and reference values")
+        points.append(point)
+    return points
+
+
+def calibration_state(server: "Server", request: Request) -> Response:
+    point = request.str_field("point", DEFAULT_POINT)
+    return json_response(server.runtime.registry.state_view(point))
+
+
+def calibration_points(server: "Server", request: Request) -> Response:
+    return json_response({"points": server.runtime.registry.point_ids()})
+
+
+def calibration_point_add(server: "Server", request: Request) -> Response:
+    point = request.str_field("point")
+    if not point:
+        raise ValueError("point is required")
+    server.runtime.registry.ensure_point(point)
+    return json_response({"point": point})
+
+
+def calibration_versions(server: "Server", request: Request) -> Response:
+    point = request.str_field("point", "")
+    versions = server.runtime.registry.applicable_ranges(point or None)
+    return json_response({"versions": versions, "count": len(versions)})
+
+
+def calibration_draft(server: "Server", request: Request) -> Response:
+    point = request.str_field("point", DEFAULT_POINT)
+    basis = request.str_field("basis")
+    raw_min = request.float_field("raw_min", 0.0)
+    raw_max = request.float_field("raw_max")
+    note = request.str_field("note", "")
+    points = _points_field(request)
+    draft, reasons = server.runtime.registry.draft_version(
+        point, basis, raw_min, raw_max, points, note
+    )
+    payload = draft.view().as_dict()
+    payload["qualified"] = not reasons
+    payload["qualification"] = reasons
+    server.runtime.auditor.record(
+        "calibration-draft",
+        f"point={point} version={draft.id} basis={basis} qualified={not reasons}",
+    )
+    return json_response(payload)
+
+
+def calibration_activate(server: "Server", request: Request) -> Response:
+    point = request.str_field("point", DEFAULT_POINT)
+    version_id = request.str_field("version")
+    version = server.runtime.registry.activate_version(point, version_id)
+    server.runtime.auditor.record(
+        "calibration-activate", f"point={point} version={version.id} basis={version.basis}"
+    )
+    return json_response(version.view().as_dict())
+
+
+def calibration_gate(server: "Server", request: Request) -> Response:
+    point = request.str_field("point", DEFAULT_POINT)
+    return json_response(server.runtime.registry.gate_status(point))
+
+
+def calibration_migrate(server: "Server", request: Request) -> Response:
+    point = request.str_field("point", DEFAULT_POINT)
+    version_id = request.str_field("version")
+    state = server.runtime.registry.begin_migration(
+        point,
+        version_id,
+        tolerance_ppm=request.float_field("tolerance_ppm", 0.0),
+        tolerance_ratio=request.float_field("tolerance_ratio", 0.10),
+        min_pairs=request.int_field("min_pairs", 5),
+    )
+    server.runtime.auditor.record(
+        "migration-begin", f"point={point} to={version_id} state=dual_run"
+    )
+    return json_response(state)
+
+
+def calibration_cutover(server: "Server", request: Request) -> Response:
+    point = request.str_field("point", DEFAULT_POINT)
+    force = request.str_field("force", "") in ("1", "true", "yes")
+    state = server.runtime.registry.cutover(point, force=force)
+    server.runtime.auditor.record(
+        "migration-cutover",
+        f"point={point} basis={state['authoritative_basis']} forced={force}",
+    )
+    return json_response(state)
+
+
+def calibration_rollback(server: "Server", request: Request) -> Response:
+    point = request.str_field("point", DEFAULT_POINT)
+    state = server.runtime.registry.rollback_migration(point)
+    server.runtime.auditor.record(
+        "migration-rollback", f"point={point} basis={state['authoritative_basis']}"
+    )
+    return json_response(state)
+
+
+def calibration_reading(server: "Server", request: Request) -> Response:
+    point = request.str_field("point", DEFAULT_POINT)
+    probe_id = request.str_field("probe", "")
+    raw = request.float_field("raw")
+    rt = server.runtime
+    threshold = rt.ammonia.threshold()
+    placeholder = 0.0
+    level = ammonia_level_for(placeholder, threshold)
+    result = rt.calibration.ingest(
+        raw,
+        point=point,
+        probe_id=probe_id,
+        level=level,
+        shadow_raw=request.float_field("shadow_raw") if "shadow_raw" in request.payload else None,
+    )
+    payload = dict(result.payload)
+    concentration = payload.get("concentration")
+    if isinstance(concentration, (int, float)):
+        payload["level"] = ammonia_level_for(float(concentration), threshold)
+        payload["threshold"] = threshold
+        if payload["level"] == "trip":
+            rt.store.put(LATCH_KEY, "true")
+            rt.interlock.trip(f"ammonia {float(concentration):.2f} ppm {payload['basis']}")
+    should_trip, reason = rt.calibration.should_trip(point)
+    payload["safety_trip"] = should_trip
+    if should_trip and not rt.interlock.is_tripped():
+        rt.interlock.trip(reason)
+    payload["tripped"] = rt.interlock.is_tripped()
+    payload["action"] = result.action
+    return json_response(payload)
+
+
+def calibration_readings(server: "Server", request: Request) -> Response:
+    point = request.str_field("point", DEFAULT_POINT)
+    readings = server.runtime.registry.readings(point)
+    return json_response({"point": point, "readings": readings, "count": len(readings)})
+
+
+def calibration_probe_add(server: "Server", request: Request) -> Response:
+    point = request.str_field("point", DEFAULT_POINT)
+    role = request.str_field("role", "standby")
+    if role not in ("primary", "standby"):
+        raise ValueError("role must be primary or standby")
+    probe = server.runtime.registry.register_probe(
+        probe_id=request.str_field("id"),
+        point=point,
+        raw_min=request.float_field("raw_min", 0.0),
+        raw_max=request.float_field("raw_max"),
+        role=role,
+        version_id=request.str_field("version", ""),
+        basis=request.str_field("basis", ""),
+    )
+    server.runtime.auditor.record(
+        "probe-register",
+        f"point={point} probe={probe.id} role={role} range={probe.raw_min}..{probe.raw_max}",
+    )
+    return json_response(probe.view().as_dict())
+
+
+def calibration_probes(server: "Server", request: Request) -> Response:
+    point = request.str_field("point", "")
+    probes = server.runtime.registry.probes(point or None)
+    return json_response({"probes": [probe.view().as_dict() for probe in probes]})
+
+
+def calibration_probe_bind(server: "Server", request: Request) -> Response:
+    probe = server.runtime.registry.bind_probe(
+        request.str_field("id"), request.str_field("version")
+    )
+    server.runtime.auditor.record(
+        "probe-bind", f"probe={probe.id} version={probe.version_id} basis={probe.basis}"
+    )
+    return json_response(probe.view().as_dict())
+
+
+def calibration_probe_mark(server: "Server", request: Request) -> Response:
+    probe = server.runtime.registry.mark_probe(
+        request.str_field("id"), request.str_field("status", "out_of_calibration")
+    )
+    server.runtime.auditor.record(
+        "probe-mark", f"probe={probe.id} status={probe.status}"
+    )
+    return json_response(probe.view().as_dict())
 
 
 def schedule_state(server: "Server", request: Request) -> Response:

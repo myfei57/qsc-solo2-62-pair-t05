@@ -56,4 +56,56 @@ def run_checks(rt: Runtime) -> list[dict[str, str]]:
     else:
         checks.append({"name": "rooms", "status": "ok", "detail": "every room assigned"})
 
+    checks.extend(_calibration_checks(rt))
+
     return checks
+
+
+def _calibration_checks(rt: Runtime) -> list[dict[str, str]]:
+    points = rt.registry.point_ids()
+    if not points:
+        return [{"name": "calibration", "status": "warn", "detail": "no monitoring point registered"}]
+    rows: list[dict[str, str]] = []
+    degraded = 0
+    migrating = 0
+    for point in points:
+        state = rt.registry.state_view(point)
+        active = state.get("active_version")
+        probes = rt.registry.probes(point)
+        point_degraded = any(
+            probe.role == "degraded" or probe.status == "out_of_calibration"
+            for probe in probes
+        )
+        if point_degraded:
+            degraded += 1
+        if state.get("migration") == "dual_run":
+            gate = state.get("gate", {})
+            migrating += 1
+            rows.append(
+                {
+                    "name": f"calibration:{point}",
+                    "status": "warn",
+                    "detail": (
+                        f"dual_run gate_passed={gate.get('passed')} "
+                        f"pairs={gate.get('pairs')}/{gate.get('min_pairs')}"
+                    ),
+                }
+            )
+        elif point_degraded or active is None:
+            degraded += 1
+            detail = "point degraded, concentration untrusted" if point_degraded else "no active version"
+            rows.append(
+                {"name": f"calibration:{point}", "status": "fail", "detail": detail}
+            )
+        else:
+            rows.append(
+                {
+                    "name": f"calibration:{point}",
+                    "status": "ok",
+                    "detail": f"basis={active.get('basis')} version={active.get('id')}",
+                }
+            )
+    overall = "fail" if degraded else ("warn" if migrating else "ok")
+    detail = f"points={len(points)} degraded={degraded} dual_run={migrating}"
+    rows.insert(0, {"name": "calibration", "status": overall, "detail": detail})
+    return rows

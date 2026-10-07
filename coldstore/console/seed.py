@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from coldstore.ammonia import Monitor
 from coldstore.ammonia.monitor import THRESHOLD_KEY as AMMONIA_THRESHOLD_KEY
+from coldstore.calib import bootstrap as bootstrap_calibration
 from coldstore.evap import Condenser
 from coldstore.evap.condenser import BASELINE_KEY as EVAP_BASELINE_KEY
 from coldstore.evap.condenser import DEFAULT_BASELINE as EVAP_BASELINE
@@ -33,6 +34,8 @@ def seed_defaults(store: Store) -> None:
     monitor = Monitor(store)
     if not has_key(store, AMMONIA_THRESHOLD_KEY):
         monitor.set_threshold(monitor.threshold())
+
+    bootstrap_calibration(store)
 
     calculator = LoadCalculator(store)
     if not has_key(store, LOAD_BASELINE_KEY):

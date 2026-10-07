@@ -44,7 +44,7 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(
             {check["name"] for check in checks["checks"]},
-            {"store", "interlock", "ammonia", "temp", "compressors", "fans", "evap", "rooms"},
+            {"store", "interlock", "ammonia", "temp", "compressors", "fans", "evap", "rooms", "calibration", "calibration:default"},
         )
 
         status, snapshot = self.call("GET", "/snapshot")
@@ -67,6 +67,7 @@ class ConsoleCase(unittest.TestCase):
                 "quota",
                 "audit",
                 "schedule",
+                "calibration",
             },
         )
 
@@ -480,6 +481,125 @@ class WsgiCase(unittest.TestCase):
             self.assertEqual(captured["status"], "200 OK")
             self.assertEqual(json.loads(body)["value"], -12.0)
             store.close()
+
+
+class CalibrationConsoleCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = Store.open(f"{self._tmp.name}/state.json")
+        seed_defaults(self.store)
+        self.server = Server(self.store)
+
+    def tearDown(self) -> None:
+        self.store.close()
+        self._tmp.cleanup()
+
+    def call(self, method: str, path: str, payload: dict | None = None):
+        response = self.server.dispatch(method, path, payload)
+        body = json.loads(response.body.decode("utf-8"))
+        return response.status, body
+
+    POINTS = [
+        {"raw": 0.0, "reference": 0.0},
+        {"raw": 25.0, "reference": 25.0},
+        {"raw": 50.0, "reference": 50.0},
+    ]
+
+    def test_legacy_bootstrap_is_listed_as_a_version(self) -> None:
+        status, body = self.call("GET", "/calibration/versions")
+        self.assertEqual(status, 200)
+        bases = {row["basis"] for row in body["versions"]}
+        self.assertIn("legacy", bases)
+        legacy = next(row for row in body["versions"] if row["basis"] == "legacy")
+        self.assertEqual(legacy["state"], "active")
+        self.assertEqual(legacy["instrument_range"]["raw_max"], 1_000_000.0)
+
+    def test_full_migration_lifecycle_over_http(self) -> None:
+        status, draft = self.call(
+            "POST",
+            "/calibration/draft",
+            {"basis": "range-50", "raw_max": 50.0, "points": self.POINTS},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(draft["qualified"])
+        new_id = draft["id"]
+
+        status, _ = self.call(
+            "POST",
+            "/calibration/probe",
+            {"id": "p50", "raw_max": 50.0, "role": "standby", "version": new_id, "basis": "range-50"},
+        )
+        self.assertEqual(status, 200)
+
+        status, _ = self.call(
+            "POST",
+            "/calibration/migrate",
+            {"version": new_id, "tolerance_ppm": 1.0, "min_pairs": 3},
+        )
+        self.assertEqual(status, 200)
+
+        for raw in (10.0, 11.0, 12.0):
+            status, reading = self.call(
+                "POST",
+                "/calibration/reading",
+                {"raw": raw, "shadow_raw": raw},
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(reading["authoritative"])
+            self.assertEqual(reading["basis"], "legacy")
+            self.assertEqual(reading["shadow"]["basis"], "range-50")
+
+        status, gate = self.call("GET", "/calibration/gate")
+        self.assertTrue(gate["passed"])
+
+        status, cutover = self.call("POST", "/calibration/cutover", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(cutover["migration"], "new")
+        self.assertEqual(cutover["authoritative_basis"], "range-50")
+
+        status, reading = self.call("POST", "/calibration/reading", {"raw": 10.0})
+        self.assertEqual(reading["basis"], "range-50")
+        self.assertTrue(reading["authoritative"])
+
+    def test_unqualified_draft_is_rejected(self) -> None:
+        status, body = self.call(
+            "POST",
+            "/calibration/draft",
+            {"basis": "thin", "raw_max": 50.0, "points": [{"raw": 0.0, "reference": 0.0}]},
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(body["qualified"])
+        status, error = self.call("POST", "/calibration/activate", {"version": body["id"]})
+        self.assertEqual(status, 400)
+        self.assertIn("3 calibration samples", error["error"])
+
+    def test_out_of_calibration_degrades_point_and_trips_interlock(self) -> None:
+        status, _ = self.call(
+            "POST", "/calibration/probe/mark", {"id": "legacy-primary", "status": "out_of_calibration"}
+        )
+        self.assertEqual(status, 200)
+        status, reading = self.call("POST", "/calibration/reading", {"raw": 4.0})
+        self.assertEqual(reading["quality"], "degraded")
+        self.assertFalse(reading["authoritative"])
+        self.assertTrue(reading["safety_trip"])
+        self.assertTrue(reading["tripped"])
+
+    def test_readings_endpoint_carries_version_and_migration(self) -> None:
+        self.call("POST", "/calibration/reading", {"raw": 3.0})
+        status, body = self.call("GET", "/calibration/readings")
+        self.assertEqual(status, 200)
+        reading = body["readings"][-1]
+        self.assertEqual(reading["version_id"], "legacy-factor-v1")
+        self.assertEqual(reading["migration"], "single")
+        self.assertEqual(reading["concentration"], 3.0)
+
+    def test_second_point_is_isolated(self) -> None:
+        self.call("POST", "/calibration/point", {"point": "zone-b"})
+        status, body = self.call("GET", "/calibration/points")
+        self.assertEqual(set(body["points"]), {"default", "zone-b"})
+        status, state = self.call("GET", "/calibration", {"point": "zone-b"})
+        self.assertEqual(status, 200)
+        self.assertIsNone(state["active_version"])
 
 
 if __name__ == "__main__":
