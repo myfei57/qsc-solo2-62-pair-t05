@@ -24,6 +24,26 @@ def run_checks(rt: Runtime) -> list[dict[str, str]]:
     else:
         checks.append({"name": "ammonia", "status": "ok", "detail": "threshold set"})
 
+    calibration = rt.calibration
+    primary = calibration.primary()
+    if not primary:
+        checks.append({"name": "calibration", "status": "warn", "detail": "no primary probe registered"})
+    else:
+        probe = next((item for item in calibration.probes() if item.id == primary), None)
+        migration = calibration.migration()
+        detail = f"mode={migration['mode']} basis={migration['current_version']}"
+        if probe is not None and not probe.healthy:
+            if calibration.healthy_standby():
+                checks.append(
+                    {"name": "calibration", "status": "warn", "detail": "primary 失校, standby available"}
+                )
+            else:
+                checks.append({"name": "calibration", "status": "fail", "detail": "primary 失校, no standby"})
+        elif migration["mode"] == "dual" and not calibration.cross_check()["ok"]:
+            checks.append({"name": "calibration", "status": "warn", "detail": detail + " cross check failing"})
+        else:
+            checks.append({"name": "calibration", "status": "ok", "detail": detail})
+
     if rt.temp.within_window():
         checks.append({"name": "temp", "status": "ok", "detail": "rate inside the window"})
     else:

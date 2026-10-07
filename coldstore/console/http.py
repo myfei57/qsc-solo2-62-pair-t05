@@ -109,6 +109,12 @@ class Request:
             return value
         return str(value)
 
+    def list_field(self, name: str) -> list:
+        value = self.payload.get(name, [])
+        if not isinstance(value, list):
+            raise RequestError(400, f"field {name} must be a list")
+        return value
+
 Handler = Callable[["Server", Request], Response]
 
 

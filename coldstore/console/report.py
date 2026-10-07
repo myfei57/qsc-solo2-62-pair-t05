@@ -25,6 +25,7 @@ def text_report(rt: Runtime) -> str:
         f"supply: {describe['supply']}",
         f"temp: {describe['temp']}",
         f"ammonia: {describe['ammonia']}",
+        f"calibration: {describe['calibration']}",
         f"interlock: {describe['interlock']}",
         f"cold_fans: {describe['cold_fans']}",
         f"evap: {describe['evap']}",

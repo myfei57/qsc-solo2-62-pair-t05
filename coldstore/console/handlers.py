@@ -545,6 +545,175 @@ def ammonia_reset(server: "Server", request: Request) -> Response:
     return json_response({"latched": server.runtime.ammonia.latched()})
 
 
+def _calibration_points(request: Request):
+    from coldstore.calibration import CalPoint
+
+    points = []
+    for item in request.list_field("points"):
+        if not isinstance(item, dict):
+            raise ValueError("each calibration point must be an object")
+        raw = item.get("raw")
+        reference = item.get("reference")
+        if raw is None or reference is None:
+            raise ValueError("each calibration point needs raw and reference")
+        points.append(CalPoint(raw=float(raw), reference=float(reference)))
+    return points
+
+
+def calibration_state(server: "Server", request: Request) -> Response:
+    return json_response(server.runtime.calibration.state())
+
+
+def calibration_versions(server: "Server", request: Request) -> Response:
+    registry = server.runtime.calibration
+    versions = [view.as_dict() for view in registry.versions()]
+    return json_response({"versions": versions, "count": len(versions)})
+
+
+def calibration_version_create(server: "Server", request: Request) -> Response:
+    registry = server.runtime.calibration
+    version = registry.create_version(
+        version_id=request.str_field("id"),
+        points=_calibration_points(request),
+        range_min=request.float_field("range_min", 0.0),
+        range_max=request.float_field("range_max", 1000.0),
+        unit=request.str_field("unit", "ppm"),
+        min_samples=request.int_field("min_samples", 2),
+        predecessor=request.str_field("predecessor", ""),
+    )
+    return json_response(version.as_dict())
+
+
+def calibration_version_activate(server: "Server", request: Request) -> Response:
+    version = server.runtime.calibration.activate(request.str_field("id"))
+    return json_response(version.as_dict())
+
+
+def calibration_scope(server: "Server", request: Request) -> Response:
+    return json_response({"scope": server.runtime.calibration.applicability()})
+
+
+def calibration_probes(server: "Server", request: Request) -> Response:
+    registry = server.runtime.calibration
+    probes = [probe.as_dict() for probe in registry.probes()]
+    return json_response(
+        {
+            "probes": probes,
+            "count": len(probes),
+            "primary": registry.primary(),
+            "healthy_standby": registry.healthy_standby(),
+        }
+    )
+
+
+def calibration_probe_register(server: "Server", request: Request) -> Response:
+    registry = server.runtime.calibration
+    probe = registry.register_probe(
+        probe_id=request.str_field("id"),
+        range_min=request.float_field("range_min", 0.0),
+        range_max=request.float_field("range_max", 1000.0),
+        role=request.str_field("role", "standby"),
+        version=request.str_field("version", ""),
+        unit=request.str_field("unit", "ppm"),
+    )
+    return json_response(probe.as_dict())
+
+
+def calibration_probe_version(server: "Server", request: Request) -> Response:
+    probe = server.runtime.calibration.assign_version(
+        request.str_field("probe"), request.str_field("version")
+    )
+    return json_response(probe.as_dict())
+
+
+def calibration_probe_lost(server: "Server", request: Request) -> Response:
+    probe = server.runtime.calibration.mark_lost(request.str_field("id"))
+    return json_response(probe.as_dict())
+
+
+def calibration_probe_repair(server: "Server", request: Request) -> Response:
+    probe = server.runtime.calibration.repair(request.str_field("id"))
+    return json_response(probe.as_dict())
+
+
+def calibration_probe_switch(server: "Server", request: Request) -> Response:
+    registry = server.runtime.calibration
+    primary = registry.switch_over(request.str_field("id"))
+    return json_response({"primary": primary})
+
+
+def calibration_policy_set(server: "Server", request: Request) -> Response:
+    registry = server.runtime.calibration
+    name = request.str_field("name")
+    if name == "tolerance":
+        registry.set_tolerance(request.float_field("value"))
+    elif name == "min_cross_samples":
+        registry.set_min_cross_samples(request.int_field("value"))
+    else:
+        registry.set_policy(name, request.str_field("value"))
+    return json_response({"policies": registry.policies()})
+
+
+def calibration_read(server: "Server", request: Request) -> Response:
+    reading = server.runtime.calibration.read(
+        request.float_field("raw"), request.str_field("probe", "")
+    )
+    return json_response(reading.as_dict())
+
+
+def calibration_readings(server: "Server", request: Request) -> Response:
+    limit = request.int_field("limit", 0)
+    readings = server.runtime.calibration.readings(limit if limit > 0 else None)
+    return json_response({"readings": [view.as_dict() for view in readings], "count": len(readings)})
+
+
+def calibration_recompute(server: "Server", request: Request) -> Response:
+    limit = request.int_field("limit", 0)
+    rows = server.runtime.calibration.recompute(
+        request.str_field("version"), limit if limit > 0 else None
+    )
+    return json_response({"rows": rows, "count": len(rows)})
+
+
+def calibration_migration(server: "Server", request: Request) -> Response:
+    registry = server.runtime.calibration
+    return json_response(
+        {"migration": registry.migration(), "cross_check": registry.cross_check()}
+    )
+
+
+def calibration_migration_dual(server: "Server", request: Request) -> Response:
+    migration = server.runtime.calibration.begin_dual(request.str_field("version"))
+    return json_response({"migration": migration})
+
+
+def calibration_migration_promote(server: "Server", request: Request) -> Response:
+    migration = server.runtime.calibration.promote()
+    return json_response({"migration": migration})
+
+
+def calibration_migration_abort(server: "Server", request: Request) -> Response:
+    migration = server.runtime.calibration.abort_dual()
+    return json_response({"migration": migration})
+
+
+def calibration_cross(server: "Server", request: Request) -> Response:
+    registry = server.runtime.calibration
+    return json_response(
+        {"cross_check": registry.cross_check(), "samples": registry.cross_samples()}
+    )
+
+
+def calibration_audit(server: "Server", request: Request) -> Response:
+    kind = request.str_field("kind", "calibration")
+    entries = [
+        entry.as_dict()
+        for entry in server.runtime.auditor.entries()
+        if entry.kind.startswith(kind)
+    ]
+    return json_response({"entries": entries, "count": len(entries)})
+
+
 def interlock_state(server: "Server", request: Request) -> Response:
     interlock = server.runtime.interlock
     payload = interlock.state().as_dict()

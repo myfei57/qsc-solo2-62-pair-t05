@@ -44,7 +44,7 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(
             {check["name"] for check in checks["checks"]},
-            {"store", "interlock", "ammonia", "temp", "compressors", "fans", "evap", "rooms"},
+            {"store", "interlock", "ammonia", "calibration", "temp", "compressors", "fans", "evap", "rooms"},
         )
 
         status, snapshot = self.call("GET", "/snapshot")
@@ -59,6 +59,7 @@ class ConsoleCase(unittest.TestCase):
                 "supply",
                 "temp",
                 "ammonia",
+                "calibration",
                 "interlock",
                 "cold_fans",
                 "evap",
@@ -449,6 +450,134 @@ class ConsoleCase(unittest.TestCase):
         status, error = self.call("POST", "/room/add", {"id": "r1", "zone": -1})
         self.assertEqual(status, 400)
         self.assertIn("non-negative", error["error"])
+
+    def test_calibration_version_and_scope_routes(self) -> None:
+        status, body = self.call("GET", "/calibration/versions")
+        self.assertEqual(status, 200)
+        self.assertEqual([version["id"] for version in body["versions"]], ["legacy-v1"])
+
+        status, body = self.call(
+            "POST",
+            "/calibration/version",
+            {
+                "id": "v2",
+                "range_min": 0,
+                "range_max": 500,
+                "min_samples": 2,
+                "points": [{"raw": 0, "reference": 0}, {"raw": 100, "reference": 90}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "draft")
+        self.assertTrue(body["sufficient"])
+
+        status, body = self.call("POST", "/calibration/activate", {"id": "v2"})
+        self.assertEqual(body["status"], "active")
+
+        status, body = self.call("GET", "/calibration/scope")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(body["scope"]), 2)
+        self.assertIn("probe range[0.0000..500.0000]", body["scope"][1]["applicability"])
+
+        status, body = self.call(
+            "POST", "/calibration/version", {"id": "bad", "points": [{"raw": 9, "reference": 1}, {"raw": 1, "reference": 0}]}
+        )
+        self.assertEqual(status, 400)
+
+    def test_calibration_probe_policy_and_failover_routes(self) -> None:
+        self.call("POST", "/calibration/probe", {"id": "prim", "range_min": 0, "range_max": 1000, "role": "primary"})
+        self.call("POST", "/calibration/probe", {"id": "bak", "range_min": 0, "range_max": 500, "role": "standby"})
+
+        status, body = self.call("GET", "/calibration/probes")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["primary"], "prim")
+        self.assertEqual(body["healthy_standby"], "bak")
+
+        status, body = self.call("POST", "/calibration/read", {"raw": 12.0, "probe": "prim"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["concentration"], 12.0)
+        self.assertEqual(body["basis"], "legacy-v1")
+
+        status, _ = self.call("POST", "/calibration/probe/lost", {"id": "prim"})
+        self.assertEqual(status, 200)
+        status, body = self.call("POST", "/calibration/read", {"raw": 12.0, "probe": "prim"})
+        self.assertEqual(body["source"], "bak")
+        self.assertIn("failover", body["flags"])
+
+        status, body = self.call(
+            "POST", "/calibration/policy", {"name": "failover", "value": "degraded"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["policies"]["failover"], "degraded")
+        status, body = self.call("POST", "/calibration/read", {"raw": 12.0, "probe": "prim"})
+        self.assertIsNone(body["concentration"])
+        self.assertIn("degraded", body["flags"])
+
+        status, body = self.call("POST", "/calibration/policy", {"name": "failover", "value": "wrong"})
+        self.assertEqual(status, 400)
+
+        status, body = self.call("GET", "/calibration/readings")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["count"], 3)
+
+    def test_calibration_migration_routes(self) -> None:
+        self.call("POST", "/calibration/probe", {"id": "old", "range_max": 1000, "role": "primary"})
+        self.call("POST", "/calibration/probe", {"id": "new", "range_max": 500, "role": "standby"})
+        self.call(
+            "POST",
+            "/calibration/version",
+            {
+                "id": "v2",
+                "range_max": 500,
+                "points": [{"raw": 0, "reference": 0}, {"raw": 100, "reference": 100}],
+            },
+        )
+        self.call("POST", "/calibration/probe/version", {"probe": "new", "version": "v2"})
+
+        status, body = self.call("POST", "/calibration/migration/dual", {"version": "v2"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["migration"]["mode"], "dual")
+
+        for raw in (10.0, 20.0, 30.0):
+            status, body = self.call("POST", "/calibration/read", {"raw": raw, "probe": "new"})
+            self.assertEqual(status, 200)
+            self.assertEqual(body["concentration"], body["legacy_concentration"])
+
+        status, body = self.call("GET", "/calibration/cross")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["cross_check"]["ok"])
+
+        status, body = self.call("POST", "/calibration/migration/promote", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["migration"]["mode"], "migrated")
+
+        status, body = self.call("GET", "/calibration/migration")
+        self.assertEqual(body["migration"]["legacy_version"], "legacy-v1")
+
+        status, body = self.call("GET", "/calibration/audit")
+        self.assertEqual(status, 200)
+        self.assertGreaterEqual(body["count"], 4)
+        kinds = {entry["kind"] for entry in body["entries"]}
+        self.assertIn("calibration.migration_promoted", kinds)
+
+    def test_calibration_promote_gate_blocks_divergence(self) -> None:
+        self.call("POST", "/calibration/probe", {"id": "new", "range_max": 500, "role": "primary"})
+        self.call(
+            "POST",
+            "/calibration/version",
+            {
+                "id": "v2",
+                "range_max": 500,
+                "points": [{"raw": 0, "reference": 0}, {"raw": 100, "reference": 50}],
+            },
+        )
+        self.call("POST", "/calibration/probe/version", {"probe": "new", "version": "v2"})
+        self.call("POST", "/calibration/migration/dual", {"version": "v2"})
+        for raw in (100.0, 80.0, 60.0):
+            self.call("POST", "/calibration/read", {"raw": raw, "probe": "new"})
+        status, body = self.call("POST", "/calibration/migration/promote", {})
+        self.assertEqual(status, 400)
+        self.assertIn("cross check gate", body["error"])
 
 
 class WsgiCase(unittest.TestCase):
